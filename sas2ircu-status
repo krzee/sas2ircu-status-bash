@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# Configuration
+BINARYPATH="/usr/sbin/sas2ircu"
+
+[[ ! -x "$BINARYPATH" ]] && echo "Error: $BINARYPATH not found or not executable." && exit 1
+
+# Variables
+NAGIOS_MODE=0
+EXIT_CODE=0
+N_GOOD_ARRAY=0
+N_BAD_ARRAY=0
+N_GOOD_DISK=0
+N_BAD_DISK=0
+
+# 2. Case statement for arguments
+case "$1" in
+    --nagios) NAGIOS_MODE=1 ;;
+    "")       NAGIOS_MODE=0 ;;
+    *)        echo "Usage: ${0##*/} [--nagios]"; exit 1 ;;
+esac
+
+# 3. Output wrapper function
+status_print() {
+    (( ! NAGIOS_MODE )) && printf -- "$@"
+}
+
+# Get Controller List
+CTRL_LIST=$($BINARYPATH LIST | awk '/^[ ]*[0-9]+/ {print $1":"$2}')
+
+if [[ ! "$CTRL_LIST" ]]; then
+    (( NAGIOS_MODE )) && echo "RAID CRITICAL - No controllers found" && exit 2
+    echo "No controllers found."
+    exit 0
+fi
+
+status_print "-- Controller informations --\n-- ID | Model | FW | BIOS\n"
+
+for CTRL_ENTRY in $CTRL_LIST; do
+    CTRL_ID="${CTRL_ENTRY%:*}"
+    CTRL_MODEL="${CTRL_ENTRY#*:}"
+
+    DISPLAY_OUT=$($BINARYPATH "$CTRL_ID" DISPLAY 2>/dev/null)
+
+    FW_VER=$(awk -F': ' '/Firmware version/ {print $2}' <<< "$DISPLAY_OUT" | tr -d '[:space:]')
+    BIOS_VER=$(awk -F': ' '/BIOS version/ {print $2}' <<< "$DISPLAY_OUT" | tr -d '[:space:]')
+
+    status_print "c%s | %s | %s | %s\n" "$CTRL_ID" "$CTRL_MODEL" "$FW_VER" "$BIOS_VER"
+
+    # --- Process Arrays ---
+    ARRAY_DATA=$(awk '
+        /^IR volume/ { id++; found_size=0; printf "\n"id"|" }
+        /Status of volume/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
+        /RAID level/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
+        /Size \(in MB\)/ {
+            if (!found_size) {
+                split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val);
+                printf int(val/1000 + 0.5)"G|"; found_size=1
+            }
+        }
+    ' <<< "$DISPLAY_OUT")
+
+    status_print "\n-- Arrays informations --\n-- ID | Type | Size | Status\n"
+
+    VOL_IDX=0
+    while IFS="|" read -r _RAW_ID STATUS TYPE SIZE; do
+        [[ ! "$STATUS" ]] && continue
+
+        if [[ "$STATUS" == "Okay (OKY)" || "$STATUS" == "Inactive, Okay (OKY)" ]]; then
+            (( N_GOOD_ARRAY++ ))
+        else
+            (( N_BAD_ARRAY++ ))
+            # Logic: Degraded/Failed/Missing = 2 (CRITICAL). Rebuilding/Syncing = 3 (WARNING).
+            if [[ "$STATUS" =~ (Degraded|Failed|Missing) ]]; then
+                EXIT_CODE=2
+            elif [[ $EXIT_CODE -lt 2 ]]; then
+                EXIT_CODE=3
+            fi
+        fi
+        status_print "c%su%s | %s | %s | %s\n" "$CTRL_ID" "$VOL_IDX" "$TYPE" "$SIZE" "$STATUS"
+        (( VOL_IDX++ ))
+    done <<< "$ARRAY_DATA"
+
+    # --- Process Disks ---
+    DISK_DATA=$(awk '
+        /^Device is a Hard disk/ {printf "\n"}
+        /Enclosure #/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); enc=val }
+        /Slot #/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf enc":"val"|" }
+        /State/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
+        /Model Number/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
+        /Serial No/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
+        /Predictive Failure Count/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
+    ' <<< "$DISPLAY_OUT")
+
+    status_print "\n-- Disks informations\n-- ID | Model | Status\n"
+
+    DISK_IDX=0
+    while IFS="|" read -r _ADDR STATE MODEL SERIAL PREDICTIVE; do
+        [[ ! "$STATE" ]] && continue
+
+        P_COUNT=$(tr -d '[:space:]' <<< "$PREDICTIVE")
+        P_COUNT="${P_COUNT:-0}"
+
+        if [[ "$STATE" == "Optimal (OPT)" ]] && (( ! P_COUNT )); then
+            (( N_GOOD_DISK++ ))
+            DISPLAY_STATE="$STATE"
+        else
+            (( N_BAD_DISK++ ))
+            # Any physical failure or predictive error is an immediate 2 (CRITICAL)
+            EXIT_CODE=2
+            (( P_COUNT )) && DISPLAY_STATE="PREDICTIVE FAILURE ($P_COUNT)" || DISPLAY_STATE="$STATE"
+        fi
+
+        status_print "c%su0p%s | %s (%s) | %s\n" "$CTRL_ID" "$DISK_IDX" "$MODEL" "$SERIAL" "$DISPLAY_STATE"
+        (( DISK_IDX++ ))
+    done <<< "$DISK_DATA"
+done
+
+# --- Final Nagios / Exit Logic ---
+MSG="Arrays: OK:$N_GOOD_ARRAY Bad:$N_BAD_ARRAY - Disks: OK:$N_GOOD_DISK Bad:$N_BAD_DISK"
+
+if (( NAGIOS_MODE )); then
+    case "$EXIT_CODE" in
+        0) echo "RAID OK - $MSG" ;;
+        3) echo "RAID WARNING (Sync/Rebuild) - $MSG" ;;
+        *) echo "RAID ERROR - $MSG" ;;
+    esac
+else
+    (( EXIT_CODE )) && echo -e "\nThere is at least one disk/array in a NOT OPTIMAL state."
+fi
+
+exit "$EXIT_CODE"
