@@ -28,7 +28,7 @@ status_print() {
     (( ! NAGIOS_MODE )) && printf -- "$@"
 }
 
-# 3. Controller Discovery with Hardware ID Fallback
+# 3. Controller Discovery (SAS2308 Hardware ID Fallback)
 CTRL_LIST=$($BINARYPATH LIST | awk '/^[ ]*[0-9]+/ {print $1":"$2":"$4}')
 
 if [[ ! "$CTRL_LIST" ]]; then
@@ -46,24 +46,21 @@ for CTRL_ENTRY in $CTRL_LIST; do
 
     DISPLAY_OUT=$($BINARYPATH "$CTRL_ID" DISPLAY 2>/dev/null)
 
-    # 4. Progress Tracking & Integer Conversion
-    # Pulls e.g., "68.56%" -> chops to "68%"
-    RAW_PCT=$($BINARYPATH "$CTRL_ID" STATUS 2>/dev/null | awk -F': ' '/Percentage complete/ {print $2}' | tr -d '[:space:]')
-    PROGRESS_PCT=${RAW_PCT%.*}
-    [[ "$PROGRESS_PCT" ]] && PROGRESS_PCT="${PROGRESS_PCT}%"
+    # 4. Strictly Conditional Progress Tracking
+    # Only call STATUS for active operations: Rebuilding or Syncing
+    PROGRESS_PCT=""
+    if grep -qE "Rebuilding|Syncing" <<< "$DISPLAY_OUT"; then
+        RAW_PCT=$($BINARYPATH "$CTRL_ID" STATUS 2>/dev/null | awk -F': ' '/Percentage complete/ {print $2}' | tr -d '[:space:]')
+        PROGRESS_PCT=${RAW_PCT%.*}
+        [[ "$PROGRESS_PCT" ]] && PROGRESS_PCT="${PROGRESS_PCT}%"
+    fi
 
     FW_VER=$(awk -F': ' '/Firmware version/ {print $2}' <<< "$DISPLAY_OUT" | tr -d '[:space:]')
     BIOS_VER=$(awk -F': ' '/BIOS version/ {print $2}' <<< "$DISPLAY_OUT" | tr -d '[:space:]')
 
-    if [[ "$CTRL_TYPE" == "UNKNOWN" ]]; then
-        case "$CTRL_DEVID" in
-            "72h") CTRL_TYPE="SAS2008" ;;
-            "97h") CTRL_TYPE="SAS2308" ;;
-            *)     CTRL_TYPE="LSI-SAS2" ;;
-        esac
-    fi
+    [[ "$CTRL_TYPE" == "UNKNOWN" && "$CTRL_DEVID" == "97h" ]] && CTRL_TYPE="SAS2308"
 
-    status_print "c%s | %s | %s | %s\n" "$CTRL_ID" "$CTRL_TYPE" "$FW_VER" "$BIOS_VER"
+    status_print "c%s | %s | %s | %s\n" "$CTRL_ID" "${CTRL_TYPE:-SAS2-HBA}" "$FW_VER" "$BIOS_VER"
 
     # --- Process Arrays ---
     ARRAY_DATA=$(awk '
@@ -91,7 +88,8 @@ for CTRL_ENTRY in $CTRL_LIST; do
             (( N_BAD_ARRAY++ ))
             if [[ "$STATUS" =~ (Degraded|Failed|Missing) ]]; then
                 EXIT_CODE=2
-                [[ "$PROGRESS_PCT" ]] && FINAL_STATUS="$STATUS ($PROGRESS_PCT)" || FINAL_STATUS="$STATUS"
+                # Only append % if the array itself is actively Rebuilding/Syncing
+                [[ "$PROGRESS_PCT" && "$STATUS" == "Degraded (DGD)" ]] && FINAL_STATUS="$STATUS ($PROGRESS_PCT)" || FINAL_STATUS="$STATUS"
             elif [[ $EXIT_CODE -lt 2 ]]; then
                 EXIT_CODE=3
                 [[ "$PROGRESS_PCT" ]] && FINAL_STATUS="$STATUS ($PROGRESS_PCT)" || FINAL_STATUS="$STATUS"
