@@ -1,15 +1,12 @@
 #!/bin/bash
 
-# Configuration
 BINARYPATH="/usr/sbin/sas2ircu"
 
-# 1. Executable check
 [[ ! -x "$BINARYPATH" ]] && {
     echo "Error: $BINARYPATH not found or not executable."
     exit 1
 }
 
-# Variables
 NAGIOS_MODE=0
 EXIT_CODE=0
 N_GOOD_ARRAY=0
@@ -17,7 +14,6 @@ N_BAD_ARRAY=0
 N_GOOD_DISK=0
 N_BAD_DISK=0
 
-# 2. Argument Parsing
 case "$1" in
     --nagios) NAGIOS_MODE=1 ;;
     "")       NAGIOS_MODE=0 ;;
@@ -28,8 +24,7 @@ status_print() {
     (( ! NAGIOS_MODE )) && printf -- "$@"
 }
 
-# 3. Controller Discovery (SAS2308 Hardware ID Fallback)
-CTRL_LIST=$($BINARYPATH LIST | awk '/^[ ]*[0-9]+/ {print $1":"$2":"$4}')
+CTRL_LIST=$($BINARYPATH LIST | awk '/^[ ]*[0-9]+/ {print $1":"$2}')
 
 if [[ ! "$CTRL_LIST" ]]; then
     (( NAGIOS_MODE )) && echo "RAID CRITICAL - No controllers found" && exit 2
@@ -40,14 +35,11 @@ fi
 status_print "-- Controller informations --\n-- ID | Model | FW | BIOS\n"
 
 for CTRL_ENTRY in $CTRL_LIST; do
-    CTRL_ID=$(echo "$CTRL_ENTRY" | cut -d: -f1)
-    CTRL_TYPE=$(echo "$CTRL_ENTRY" | cut -d: -f2)
-    CTRL_DEVID=$(echo "$CTRL_ENTRY" | cut -d: -f3)
+    CTRL_ID=${CTRL_ENTRY%:*}
+    CTRL_TYPE=${CTRL_ENTRY#*:}
 
     DISPLAY_OUT=$($BINARYPATH "$CTRL_ID" DISPLAY 2>/dev/null)
 
-    # 4. Strictly Conditional Progress Tracking
-    # Only call STATUS for active operations: Rebuilding or Syncing
     PROGRESS_PCT=""
     if grep -qE "Rebuilding|Syncing" <<< "$DISPLAY_OUT"; then
         RAW_PCT=$($BINARYPATH "$CTRL_ID" STATUS 2>/dev/null | awk -F': ' '/Percentage complete/ {print $2}' | tr -d '[:space:]')
@@ -58,11 +50,8 @@ for CTRL_ENTRY in $CTRL_LIST; do
     FW_VER=$(awk -F': ' '/Firmware version/ {print $2}' <<< "$DISPLAY_OUT" | tr -d '[:space:]')
     BIOS_VER=$(awk -F': ' '/BIOS version/ {print $2}' <<< "$DISPLAY_OUT" | tr -d '[:space:]')
 
-    [[ "$CTRL_TYPE" == "UNKNOWN" && "$CTRL_DEVID" == "97h" ]] && CTRL_TYPE="SAS2308"
+    status_print "c%s | %s | %s | %s\n" "$CTRL_ID" "$CTRL_TYPE" "$FW_VER" "$BIOS_VER"
 
-    status_print "c%s | %s | %s | %s\n" "$CTRL_ID" "${CTRL_TYPE:-SAS2-HBA}" "$FW_VER" "$BIOS_VER"
-
-    # --- Process Arrays ---
     ARRAY_DATA=$(awk '
         /^IR volume/ { id++; found_size=0; printf "\n"id"|" }
         /Status of volume/ { split($0,a,": "); val=a[2]; gsub(/^[ \t]+|[ \t]+$/, "", val); printf val"|" }
@@ -88,7 +77,6 @@ for CTRL_ENTRY in $CTRL_LIST; do
             (( N_BAD_ARRAY++ ))
             if [[ "$STATUS" =~ (Degraded|Failed|Missing) ]]; then
                 EXIT_CODE=2
-                # Only append % if the array itself is actively Rebuilding/Syncing
                 [[ "$PROGRESS_PCT" && "$STATUS" == "Degraded (DGD)" ]] && FINAL_STATUS="$STATUS ($PROGRESS_PCT)" || FINAL_STATUS="$STATUS"
             elif [[ $EXIT_CODE -lt 2 ]]; then
                 EXIT_CODE=3
@@ -99,7 +87,6 @@ for CTRL_ENTRY in $CTRL_LIST; do
         (( VOL_IDX++ ))
     done <<< "$ARRAY_DATA"
 
-    # --- Process Disks ---
     DISK_DATA=$(awk '
         BEGIN { printf "\n" }
         /^Device is a Hard disk/ { if (count > 0) printf "\n"; count++; model="UNK"; state="UNK"; serial="UNK"; pred=0 }
@@ -141,7 +128,6 @@ for CTRL_ENTRY in $CTRL_LIST; do
     done <<< "$DISK_DATA"
 done
 
-# --- Final Summary ---
 MSG="Arrays: OK:$N_GOOD_ARRAY Bad:$N_BAD_ARRAY - Disks: OK:$N_GOOD_DISK Bad:$N_BAD_DISK"
 
 if (( NAGIOS_MODE )); then
