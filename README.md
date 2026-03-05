@@ -22,10 +22,10 @@ The Bash version was developed to remove the Python 2 dependency while significa
 
 The exit codes have been refined to allow parent monitoring scripts to distinguish between environment errors and hardware failures.
 Code	Status	Meaning
-0	OK	All Volumes/Disks are Healthy & 0 Predictive Failures.
-1	General Error	Environment issue (e.g., sas2ircu binary missing or permission denied).
-2	CRITICAL	Hardware failure: Drive missing, Volume Degraded/Failed, or Predictive Failure detected.
-3	WARNING	Transient state: Volume is currently Rebuilding or Syncing.
+* 0	OK	All Volumes/Disks are Healthy & 0 Predictive Failures.
+* 1	General Error	Environment issue (e.g., sas2ircu binary missing or permission denied).
+* 2	CRITICAL	Hardware failure: Drive missing, Volume Degraded/Failed, or Predictive Failure detected.
+* 3	WARNING	Transient state: Volume is currently Rebuilding or Syncing.
 🛠 Usage
 Standard Output
 Bash
